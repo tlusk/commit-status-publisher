@@ -1,5 +1,6 @@
 package jetbrains.buildServer.commitPublisher;
 
+import com.google.common.base.Objects;
 import com.intellij.openapi.diagnostic.Logger;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
@@ -16,6 +17,7 @@ import jetbrains.buildServer.users.User;
 import jetbrains.buildServer.util.EventDispatcher;
 import jetbrains.buildServer.vcs.SVcsModification;
 import jetbrains.buildServer.vcs.SVcsRoot;
+import jetbrains.buildServer.vcs.SelectPrevBuildPolicy;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import jetbrains.buildServer.commitPublisher.CommitStatusPublisher.Event;
@@ -127,6 +129,30 @@ public class CommitStatusPublisherListener extends BuildServerAdapter {
         @Override
         public boolean run(@NotNull CommitStatusPublisher publisher, @NotNull BuildRevision revision) throws PublisherException {
           Comment comment = build.getBuildPromotion().getBuildComment();
+
+          for (SQueuedBuild queuedBuild : build.getBuildType().getQueuedBuilds(null)) {
+            if (Objects.equal(queuedBuild.getBuildPromotion().getBranch(), build.getBuildPromotion().getBranch())) {
+              submitTaskForQueuedBuild(Event.QUEUED, queuedBuild);
+              return true;
+            }
+          }
+
+          for (SRunningBuild runningBuild : build.getBuildType().getRunningBuilds()) {
+            if (runningBuild.getBuildPromotion().getRevisions().contains(revision)) {
+              submitTaskForBuild(Event.STARTED, runningBuild);
+              return true;
+            }
+          }
+
+          if (comment != null && comment.getComment() != null &&
+            (comment.getComment().contains("optimized") || comment.getComment().contains("substituted"))) {
+            BuildPromotion promotion = build.getBuildPromotion().getPreviousBuildPromotion(SelectPrevBuildPolicy.SINCE_LAST_COMPLETE_BUILD);
+            if (promotion != null && promotion.getAssociatedBuild() != null) {
+              submitTaskForBuild(Event.FINISHED, promotion.getAssociatedBuild());
+              return true;
+            }
+          }
+
           return publisher.buildRemovedFromQueue(build, revision, comment == null ? null : comment.getUser(), comment == null ? null : comment.getComment());
         }
       }
