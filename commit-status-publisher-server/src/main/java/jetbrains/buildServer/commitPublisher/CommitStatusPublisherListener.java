@@ -158,7 +158,7 @@ public class CommitStatusPublisherListener extends BuildServerAdapter {
     if (buildType == null)
       return;
 
-    if (user == null)
+    if (comment.equals("Build started"))
       return;
 
     runForEveryPublisherQueued(Event.REMOVED_FROM_QUEUE, buildType, build, new PublishTask() {

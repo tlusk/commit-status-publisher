@@ -1,15 +1,21 @@
 package jetbrains.buildServer.commitPublisher.gitlab;
 
+import com.google.common.base.Objects;
 import com.google.gson.Gson;
 import com.intellij.openapi.diagnostic.Logger;
+
+import java.io.IOException;
 import java.util.LinkedHashMap;
 import jetbrains.buildServer.commitPublisher.*;
 import jetbrains.buildServer.serverSide.*;
 import jetbrains.buildServer.serverSide.executors.ExecutorServices;
 import jetbrains.buildServer.serverSide.impl.LogUtil;
-import jetbrains.buildServer.vcs.VcsRoot;
-import jetbrains.buildServer.vcs.VcsRootInstance;
+import jetbrains.buildServer.users.User;
+import jetbrains.buildServer.vcs.*;
+import org.apache.http.HttpResponse;
+import org.apache.http.StatusLine;
 import org.apache.http.entity.ContentType;
+import org.apache.http.util.EntityUtils;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -48,6 +54,39 @@ class GitlabPublisher extends HttpBasedCommitStatusPublisher {
     return "GitLab";
   }
 
+  @Override
+  public boolean buildQueued(@NotNull SQueuedBuild build, @NotNull BuildRevision revision) throws PublisherException {
+    publish(build, revision, GitlabBuildStatus.PENDING, "Build queued");
+    return true;
+  }
+
+  @Override
+  public boolean buildRemovedFromQueue(@NotNull SQueuedBuild build, @NotNull BuildRevision revision, @Nullable User user, @Nullable String comment) throws PublisherException {
+    for (SQueuedBuild queuedBuild : build.getBuildType().getQueuedBuilds(null)) {
+      if (Objects.equal(queuedBuild.getBuildPromotion().getBranch(), build.getBuildPromotion().getBranch())) {
+        buildQueued(queuedBuild, revision);
+        return true;
+      }
+    }
+
+    for (SRunningBuild runningBuild : build.getBuildType().getRunningBuilds()) {
+      if (runningBuild.getBuildPromotion().getRevisions().contains(revision)) {
+        buildStarted(runningBuild, revision);
+        return true;
+      }
+    }
+
+    if (comment != null && (comment.contains("optimized") || comment.contains("substituted"))) {
+      BuildPromotion promotion = build.getBuildPromotion().getPreviousBuildPromotion(SelectPrevBuildPolicy.SINCE_LAST_COMPLETE_BUILD);
+      if (promotion != null && promotion.getAssociatedBuild() != null) {
+        buildFinished((SFinishedBuild) promotion.getAssociatedBuild(), revision);
+        return true;
+      }
+    }
+
+    publish(build, revision, GitlabBuildStatus.CANCELED, "Build canceled");
+    return true;
+  }
 
   @Override
   public boolean buildStarted(@NotNull SRunningBuild build, @NotNull BuildRevision revision) throws PublisherException {
@@ -83,11 +122,25 @@ class GitlabPublisher extends HttpBasedCommitStatusPublisher {
     return true;
   }
 
-
   private void publish(@NotNull SBuild build,
                        @NotNull BuildRevision revision,
                        @NotNull GitlabBuildStatus status,
                        @NotNull String description) throws PublisherException {
+    String message = createMessage(status, build.getBuildTypeName(), revision, myLinks.getViewResultsUrl(build), description);
+    publish(message, revision, LogUtil.describe(build));
+  }
+
+  private void publish(@NotNull SQueuedBuild build,
+                       @NotNull BuildRevision revision,
+                       @NotNull GitlabBuildStatus status,
+                       @NotNull String description) throws PublisherException {
+    String message = createMessage(status, build.getBuildType().getName(), revision, myLinks.getQueuedBuildUrl(build), description);
+    publish(message, revision, LogUtil.describe(build));
+  }
+
+  private void publish(@NotNull String message,
+                       @NotNull BuildRevision revision,
+                       @NotNull String buildDescription) throws PublisherException {
     VcsRootInstance root = revision.getRoot();
     String apiUrl = getApiUrl();
     if (null == apiUrl || apiUrl.length() == 0)
@@ -97,12 +150,11 @@ class GitlabPublisher extends HttpBasedCommitStatusPublisher {
     if (repository == null)
       throw new PublisherException("Cannot parse repository URL from VCS root " + root.getName());
 
-    String message = createMessage(status, build, revision, myLinks.getViewResultsUrl(build), description);
     try {
-      publish(revision.getRevision(), message, repository, LogUtil.describe(build));
+      publish(revision.getRevision(), message, repository, buildDescription);
     } catch (Exception e) {
       throw new PublisherException("Cannot publish status to GitLab for VCS root " +
-                                   revision.getRoot().getName() + ": " + e.toString(), e);
+        revision.getRoot().getName() + ": " + e.toString(), e);
     }
   }
 
@@ -112,9 +164,20 @@ class GitlabPublisher extends HttpBasedCommitStatusPublisher {
     postAsync(url, null, null, data, ContentType.APPLICATION_JSON, Collections.singletonMap("PRIVATE-TOKEN", getPrivateToken()), buildDescription);
   }
 
+  @Override
+  public void processResponse(@NotNull final HttpResponse response) throws HttpPublisherException, IOException {
+    StatusLine statusLine = response.getStatusLine();
+    if (statusLine.getStatusCode() >= 400) {
+      String responseString = EntityUtils.toString(response.getEntity());
+      if (!responseString.contains("Cannot transition status via :enqueue from :pending")) {
+        throw new HttpPublisherException(statusLine.getStatusCode(), statusLine.getReasonPhrase(), "HTTP response error");
+      }
+    }
+  }
+
   @NotNull
   private String createMessage(@NotNull GitlabBuildStatus status,
-                               @NotNull SBuild build,
+                               @NotNull String name,
                                @NotNull BuildRevision revision,
                                @NotNull String url,
                                @NotNull String description) {
@@ -133,7 +196,7 @@ class GitlabPublisher extends HttpBasedCommitStatusPublisher {
 
     final Map<String, String> data = new LinkedHashMap<String, String>();
     data.put("state", status.getName());
-    data.put("name", build.getBuildTypeName());
+    data.put("name", name);
     data.put("target_url", url);
     data.put("description", description);
     if (ref != null)
