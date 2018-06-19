@@ -1,5 +1,6 @@
 package jetbrains.buildServer.commitPublisher;
 
+import com.google.common.base.Objects;
 import com.intellij.openapi.diagnostic.Logger;
 import java.util.*;
 import jetbrains.buildServer.BuildProblemData;
@@ -8,8 +9,10 @@ import jetbrains.buildServer.serverSide.*;
 import jetbrains.buildServer.serverSide.impl.LogUtil;
 import jetbrains.buildServer.users.User;
 import jetbrains.buildServer.util.EventDispatcher;
+import jetbrains.buildServer.util.StringUtil;
 import jetbrains.buildServer.vcs.SVcsModification;
 import jetbrains.buildServer.vcs.SVcsRoot;
+import jetbrains.buildServer.vcs.SelectPrevBuildPolicy;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import jetbrains.buildServer.commitPublisher.CommitStatusPublisher.Event;
@@ -18,6 +21,7 @@ public class CommitStatusPublisherListener extends BuildServerAdapter {
 
   private final static Logger LOG = Logger.getInstance(CommitStatusPublisherListener.class.getName());
   private final static String PUBLISHING_ENABLED_PROPERTY_NAME = "teamcity.commitStatusPublisher.enabled";
+  private final static String PUBLISHING_TO_DEPENDENCIES_ENABLED_PROPERTY_NAME = "teamcity.commitStatusPublisher.publishToDependencies";
 
   private final PublisherManager myPublisherManager;
   private final BuildHistory myBuildHistory;
@@ -65,10 +69,14 @@ public class CommitStatusPublisherListener extends BuildServerAdapter {
       return;
     }
 
+    buildFinished(finishedBuild, buildType);
+  }
+
+  public void buildFinished(@NotNull final SFinishedBuild build, SBuildType buildType) {
     runForEveryPublisher(Event.FINISHED, buildType, build, new PublishTask() {
       @Override
       public boolean run(@NotNull CommitStatusPublisher publisher, @NotNull BuildRevision revision) throws PublisherException {
-        return publisher.buildFinished(finishedBuild, revision);
+        return publisher.buildFinished(build, revision);
       }
     });
   }
@@ -167,6 +175,28 @@ public class CommitStatusPublisherListener extends BuildServerAdapter {
     runForEveryPublisherQueued(Event.REMOVED_FROM_QUEUE, buildType, build, new PublishTask() {
       @Override
       public boolean run(@NotNull CommitStatusPublisher publisher, @NotNull BuildRevision revision) throws PublisherException {
+        for (SQueuedBuild queuedBuild : build.getBuildType().getQueuedBuilds(null)) {
+          if (Objects.equal(queuedBuild.getBuildPromotion().getBranch(), build.getBuildPromotion().getBranch())) {
+            buildTypeAddedToQueue(queuedBuild);
+            return true;
+          }
+        }
+
+        for (SRunningBuild runningBuild : build.getBuildType().getRunningBuilds()) {
+          if (runningBuild.getBuildPromotion().getRevisions().contains(revision)) {
+            changesLoaded(runningBuild);
+            return true;
+          }
+        }
+
+        if (comment.contains("optimized") || comment.contains("substituted")) {
+          BuildPromotion promotion = build.getBuildPromotion().getPreviousBuildPromotion(SelectPrevBuildPolicy.SINCE_LAST_COMPLETE_BUILD);
+          if (promotion != null && promotion.getAssociatedBuild() != null) {
+            buildFinished((SFinishedBuild) promotion.getAssociatedBuild(), build.getBuildType());
+            return true;
+          }
+        }
+
         return publisher.buildRemovedFromQueue(build, revision, user, comment);
       }
     });
@@ -177,6 +207,11 @@ public class CommitStatusPublisherListener extends BuildServerAdapter {
     return "false".equals(publishingEnabledParam)
            || !(TeamCityProperties.getBooleanOrTrue(PUBLISHING_ENABLED_PROPERTY_NAME)
                 || "true".equals(publishingEnabledParam));
+  }
+
+  private boolean isPublishingToDependenciesEnabled(SBuildType buildType) {
+    String publishingEnabledParam = buildType.getParameterValue(PUBLISHING_TO_DEPENDENCIES_ENABLED_PROPERTY_NAME);
+    return StringUtil.areEqualIgnoringCase("true", publishingEnabledParam);
   }
 
   private void logStatusNotPublished(@NotNull Event event, @NotNull String buildDescription, @NotNull CommitStatusPublisher publisher, @NotNull String message) {
@@ -204,17 +239,34 @@ public class CommitStatusPublisherListener extends BuildServerAdapter {
         logStatusNotPublished(event, LogUtil.describe(build), publisher, "commit status publishing is disabled");
         continue;
       }
-      List<BuildRevision> revisions = getBuildRevisionForVote(publisher, build);
-      if (revisions.isEmpty()) {
-        logStatusNotPublished(event, LogUtil.describe(build), publisher, "no compatible revisions found");
-        continue;
-      }
-      myProblems.clearProblem(publisher);
-      for (BuildRevision revision: revisions) {
-        runTask(event, build.getBuildPromotion(), LogUtil.describe(build), task, publisher, revision);
-      }
+      runForPublisher(event, build, task, publisher, isPublishingToDependenciesEnabled(buildType));
     }
     myProblems.clearObsoleteProblems(buildType, publishers.keySet());
+  }
+
+  private void runForPublisher(@NotNull Event event,
+                               @NotNull SBuild build,
+                               @NotNull PublishTask task,
+                               @NotNull CommitStatusPublisher publisher,
+                               boolean publishDependencies) {
+    if (publishDependencies) {
+      for (BuildPromotion bp : build.getBuildPromotion().getAllDependencies()) {
+        final SBuild associatedBuild = bp.getAssociatedBuild();
+        if (associatedBuild != null) {
+          runForPublisher(event, associatedBuild, task, publisher, true);
+        }
+      }
+    }
+
+    List<BuildRevision> revisions = getBuildRevisionForVote(publisher, build);
+    if (revisions.isEmpty()) {
+      logStatusNotPublished(event, LogUtil.describe(build), publisher, "no compatible revisions found");
+      return;
+    }
+    myProblems.clearProblem(publisher);
+    for (BuildRevision revision: revisions) {
+      runTask(event, build.getBuildPromotion(), LogUtil.describe(build), task, publisher, revision);
+    }
   }
 
   private void runForEveryPublisherQueued(@NotNull Event event, @NotNull SBuildType buildType, @NotNull SQueuedBuild build, @NotNull PublishTask task) {
@@ -238,17 +290,38 @@ public class CommitStatusPublisherListener extends BuildServerAdapter {
         logStatusNotPublished(event, LogUtil.describe(build), publisher, "commit status publishing is disabled");
         continue;
       }
-      List<BuildRevision> revisions = getQueuedBuildRevisionForVote(buildType, publisher, build);
-      if (revisions.isEmpty()) {
-        logStatusNotPublished(event, LogUtil.describe(build), publisher, "no compatible revisions found");
-        continue;
-      }
-      myProblems.clearProblem(publisher);
-      for (BuildRevision revision: revisions) {
-        runTask(event, build.getBuildPromotion(), LogUtil.describe(build), task, publisher, revision);
-      }
+      runForPublisherQueued(event, buildType, build, task, publisher, isPublishingToDependenciesEnabled(buildType));
     }
     myProblems.clearObsoleteProblems(buildType, publishers.keySet());
+  }
+
+  private void runForPublisherQueued(@NotNull Event event,
+                                     @NotNull SBuildType buildType,
+                                     @NotNull SQueuedBuild build,
+                                     @NotNull PublishTask task,
+                                     @NotNull CommitStatusPublisher publisher,
+                                     boolean publishDependencies) {
+    if (publishDependencies) {
+      for (BuildPromotion bp : build.getBuildPromotion().getAllDependencies()) {
+        final SQueuedBuild queuedBuild = bp.getQueuedBuild();
+        final SBuild associatedBuild = bp.getAssociatedBuild();
+        if (associatedBuild != null) {
+          runForPublisher(event, associatedBuild, task, publisher, true);
+        } else if (queuedBuild != null && bp.getBuildType() != null) {
+          runForPublisherQueued(event, bp.getBuildType(), queuedBuild, task, publisher, true);
+        }
+      }
+    }
+
+    List<BuildRevision> revisions = getQueuedBuildRevisionForVote(buildType, publisher, build);
+    if (revisions.isEmpty()) {
+      logStatusNotPublished(event, LogUtil.describe(build), publisher, "no compatible revisions found");
+      return;
+    }
+    myProblems.clearProblem(publisher);
+    for (BuildRevision revision: revisions) {
+      runTask(event, build.getBuildPromotion(), LogUtil.describe(build), task, publisher, revision);
+    }
   }
 
   private void runTask(@NotNull Event event,
