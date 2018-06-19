@@ -1,11 +1,13 @@
 package jetbrains.buildServer.commitPublisher.gitlab;
 
-import com.google.common.base.Objects;
 import com.google.gson.Gson;
 import com.intellij.openapi.diagnostic.Logger;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.Map;
+
 import jetbrains.buildServer.commitPublisher.*;
 import jetbrains.buildServer.serverSide.*;
 import jetbrains.buildServer.serverSide.executors.ExecutorServices;
@@ -18,9 +20,6 @@ import org.apache.http.entity.ContentType;
 import org.apache.http.util.EntityUtils;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
-
-import java.util.Collections;
-import java.util.Map;
 
 class GitlabPublisher extends HttpBasedCommitStatusPublisher {
 
@@ -62,28 +61,6 @@ class GitlabPublisher extends HttpBasedCommitStatusPublisher {
 
   @Override
   public boolean buildRemovedFromQueue(@NotNull SQueuedBuild build, @NotNull BuildRevision revision, @Nullable User user, @Nullable String comment) throws PublisherException {
-    for (SQueuedBuild queuedBuild : build.getBuildType().getQueuedBuilds(null)) {
-      if (Objects.equal(queuedBuild.getBuildPromotion().getBranch(), build.getBuildPromotion().getBranch())) {
-        buildQueued(queuedBuild, revision);
-        return true;
-      }
-    }
-
-    for (SRunningBuild runningBuild : build.getBuildType().getRunningBuilds()) {
-      if (runningBuild.getBuildPromotion().getRevisions().contains(revision)) {
-        buildStarted(runningBuild, revision);
-        return true;
-      }
-    }
-
-    if (comment != null && (comment.contains("optimized") || comment.contains("substituted"))) {
-      BuildPromotion promotion = build.getBuildPromotion().getPreviousBuildPromotion(SelectPrevBuildPolicy.SINCE_LAST_COMPLETE_BUILD);
-      if (promotion != null && promotion.getAssociatedBuild() != null) {
-        buildFinished((SFinishedBuild) promotion.getAssociatedBuild(), revision);
-        return true;
-      }
-    }
-
     publish(build, revision, GitlabBuildStatus.CANCELED, "Build canceled");
     return true;
   }
