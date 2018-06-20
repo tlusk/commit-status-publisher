@@ -107,6 +107,50 @@
         publishing statuses for commits in all attached VCS roots.</span>
     </td>
   </tr>
+
+  <tr class="advancedSetting">
+    <th>Options:</th>
+    <td>
+      <props:checkboxProperty name="${constants.publishToDependencies}"/>
+      <label for="${constants.publishToDependencies}">Publish to dependencies</label>
+      <span class="smallNote">
+        This will publish the status of this build configuration to all dependent build configurations in the build chain.
+      </span>
+    </td>
+  </tr>
+
+  <tr class="advancedSetting">
+    <th></th>
+    <td>
+      <props:checkboxProperty name="${constants.publishToDependenciesUnmatchedBranches}"/>
+      <label for="${constants.publishToDependenciesUnmatchedBranches}">Publish to dependencies unmatched branches</label>
+      <span class="smallNote">
+          This option will publish all builds to their dependencies including default branches if no branch matches the name
+          of the branch being built by the published build configuration.
+        </span>
+    </td>
+  </tr>
+
+  <tr class="advancedSetting">
+    <th><label for="${constants.publishToDependenciesWhitelistPattern}">Dependency Whitelist Pattern: </label></th>
+    <td>
+      <props:textProperty name="${constants.publishToDependenciesWhitelistPattern}" className="longField"/>
+      <span class="smallNote">
+        Optional regex of the git repository urls to whitelist when publishing to dependencies.
+      </span>
+    </td>
+  </tr>
+
+  <tr class="advancedSetting">
+    <th><label for="${constants.publishToDependenciesBlacklistPattern}">Dependency Blacklist Pattern: </label></th>
+    <td>
+      <props:textProperty name="${constants.publishToDependenciesBlacklistPattern}" className="longField"/>
+      <span class="smallNote">
+          Optional regex of the git repository urls to blacklist when publishing to dependencies.
+        </span>
+    </td>
+  </tr>
+
   <tr>
     <th>
       <label for="${constants.publisherIdParam}">Publisher:&nbsp;<l:star/></label>

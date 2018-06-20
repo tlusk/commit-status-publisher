@@ -9,7 +9,6 @@ import jetbrains.buildServer.serverSide.*;
 import jetbrains.buildServer.serverSide.impl.LogUtil;
 import jetbrains.buildServer.users.User;
 import jetbrains.buildServer.util.EventDispatcher;
-import jetbrains.buildServer.util.StringUtil;
 import jetbrains.buildServer.vcs.SVcsModification;
 import jetbrains.buildServer.vcs.SVcsRoot;
 import jetbrains.buildServer.vcs.SelectPrevBuildPolicy;
@@ -21,7 +20,6 @@ public class CommitStatusPublisherListener extends BuildServerAdapter {
 
   private final static Logger LOG = Logger.getInstance(CommitStatusPublisherListener.class.getName());
   private final static String PUBLISHING_ENABLED_PROPERTY_NAME = "teamcity.commitStatusPublisher.enabled";
-  private final static String PUBLISHING_TO_DEPENDENCIES_ENABLED_PROPERTY_NAME = "teamcity.commitStatusPublisher.publishToDependencies";
 
   private final PublisherManager myPublisherManager;
   private final BuildHistory myBuildHistory;
@@ -206,11 +204,6 @@ public class CommitStatusPublisherListener extends BuildServerAdapter {
                 || "true".equals(publishingEnabledParam));
   }
 
-  private boolean isPublishingToDependenciesEnabled(SBuildType buildType) {
-    String publishingEnabledParam = buildType.getParameterValue(PUBLISHING_TO_DEPENDENCIES_ENABLED_PROPERTY_NAME);
-    return StringUtil.areEqualIgnoringCase("true", publishingEnabledParam);
-  }
-
   private void logStatusNotPublished(@NotNull Event event, @NotNull String buildDescription, @NotNull CommitStatusPublisher publisher, @NotNull String message) {
     LOG.info(String.format("Event: %s, build %s, publisher %s: %s", event.getName(), buildDescription, publisher.toString(), message));
   }
@@ -232,7 +225,7 @@ public class CommitStatusPublisherListener extends BuildServerAdapter {
         logStatusNotPublished(event, LogUtil.describe(build), publisher, "commit status publishing is disabled");
         continue;
       }
-      runForPublisher(event, build, task, publisher, isPublishingToDependenciesEnabled(buildType));
+      runForPublisher(event, build, task, publisher, build.getBranch(), false);
     }
     myProblems.clearObsoleteProblems(buildType, publishers.keySet());
   }
@@ -241,12 +234,13 @@ public class CommitStatusPublisherListener extends BuildServerAdapter {
                                @NotNull SBuild build,
                                @NotNull PublishTask task,
                                @NotNull CommitStatusPublisher publisher,
-                               boolean publishDependencies) {
-    if (publishDependencies) {
+                               Branch originalBranch,
+                               boolean publishingToDependency) {
+    if (publisher.isDependencyPublishingEnabled()) {
       for (BuildPromotion bp : build.getBuildPromotion().getAllDependencies()) {
         final SBuild associatedBuild = bp.getAssociatedBuild();
         if (associatedBuild != null) {
-          runForPublisher(event, associatedBuild, task, publisher, true);
+          runForPublisher(event, associatedBuild, task, publisher, originalBranch, true);
         }
       }
     }
@@ -258,7 +252,9 @@ public class CommitStatusPublisherListener extends BuildServerAdapter {
     }
     myProblems.clearProblem(publisher);
     for (BuildRevision revision: revisions) {
-      runTask(event, build.getBuildPromotion(), LogUtil.describe(build), task, publisher, revision);
+      if (!publishingToDependency || shouldDependencyPublish(publisher, revision, originalBranch)) {
+        runTask(event, build.getBuildPromotion(), LogUtil.describe(build), task, publisher, revision);
+      }
     }
   }
 
@@ -279,7 +275,7 @@ public class CommitStatusPublisherListener extends BuildServerAdapter {
         logStatusNotPublished(event, LogUtil.describe(build), publisher, "commit status publishing is disabled");
         continue;
       }
-      runForPublisherQueued(event, buildType, build, task, publisher, isPublishingToDependenciesEnabled(buildType));
+      runForPublisherQueued(event, buildType, build, task, publisher, build.getBuildPromotion().getBranch(), false);
     }
     myProblems.clearObsoleteProblems(buildType, publishers.keySet());
   }
@@ -289,27 +285,29 @@ public class CommitStatusPublisherListener extends BuildServerAdapter {
                                      @NotNull SQueuedBuild build,
                                      @NotNull PublishTask task,
                                      @NotNull CommitStatusPublisher publisher,
-                                     boolean publishDependencies) {
-    if (publishDependencies) {
+                                     Branch originalBranch,
+                                     boolean publishingToDependency) {
+    if (publisher.isDependencyPublishingEnabled()) {
       for (BuildPromotion bp : build.getBuildPromotion().getAllDependencies()) {
         final SQueuedBuild queuedBuild = bp.getQueuedBuild();
         final SBuild associatedBuild = bp.getAssociatedBuild();
         if (associatedBuild != null) {
-          runForPublisher(event, associatedBuild, task, publisher, true);
+          runForPublisher(event, associatedBuild, task, publisher, originalBranch, true);
         } else if (queuedBuild != null && bp.getBuildType() != null) {
-          runForPublisherQueued(event, bp.getBuildType(), queuedBuild, task, publisher, true);
+          runForPublisherQueued(event, bp.getBuildType(), queuedBuild, task, publisher, originalBranch, true);
         }
       }
     }
-
     List<BuildRevision> revisions = getQueuedBuildRevisionForVote(buildType, publisher, build);
     if (revisions.isEmpty()) {
       logStatusNotPublished(event, LogUtil.describe(build), publisher, "no compatible revisions found");
       return;
     }
     myProblems.clearProblem(publisher);
-    for (BuildRevision revision: revisions) {
-      runTask(event, build.getBuildPromotion(), LogUtil.describe(build), task, publisher, revision);
+    for (BuildRevision revision : revisions) {
+      if (!publishingToDependency || shouldDependencyPublish(publisher, revision, originalBranch)) {
+        runTask(event, build.getBuildPromotion(), LogUtil.describe(build), task, publisher, revision);
+      }
     }
   }
 
@@ -424,5 +422,36 @@ public class CommitStatusPublisherListener extends BuildServerAdapter {
 
   private boolean shouldFailBuild(@NotNull SBuildType buildType) {
     return Boolean.valueOf(buildType.getParameters().get("teamcity.commitStatusPublisher.failBuildOnPublishError"));
+  }
+
+  private boolean shouldDependencyPublish(@NotNull CommitStatusPublisher publisher,
+                                          @NotNull BuildRevision revision,
+                                          Branch originalBranch) {
+    if ("jetbrains.git".equals(revision.getRoot().getVcsName())) {
+      if (!originalBranch.isDefaultBranch() &&
+        !publisher.isDependencyPublishingUnmatchedBranchesEnabled() &&
+        Objects.equal(revision.getRoot().getProperty("branch"), revision.getRepositoryVersion().getVcsBranch())) {
+        // Don't publish to the default branch of a dependency unless it was triggered by the default branch
+        // or we've enabled unmatched publishing
+        return false;
+      }
+
+      if (publisher.getDependencyPublishingWhitelistPattern() != null &&
+        !publisher.getDependencyPublishingWhitelistPattern().trim().isEmpty() &&
+        revision.getRoot().getProperty("url") != null &&
+        !revision.getRoot().getProperty("url").matches(publisher.getDependencyPublishingWhitelistPattern())) {
+        // Don't publish if the whitelist regex is set and doesn't match
+        return false;
+      }
+
+      if (publisher.getDependencyPublishingBlacklistPattern() != null &&
+        !publisher.getDependencyPublishingBlacklistPattern().trim().isEmpty() &&
+        revision.getRoot().getProperty("url") != null &&
+        revision.getRoot().getProperty("url").matches(publisher.getDependencyPublishingBlacklistPattern())) {
+        // Don't publish if the blacklist regex is set and matches
+        return false;
+      }
+    }
+    return true;
   }
 }
